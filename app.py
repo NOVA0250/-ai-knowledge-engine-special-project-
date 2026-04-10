@@ -1,4 +1,4 @@
-# MUST BE THE FIRST LINE
+# 1. SQLITE FIX (MUST BE FIRST)
 import sys
 try:
     __import__('pysqlite3')
@@ -9,9 +9,11 @@ except ImportError:
 import streamlit as st
 import os
 import tempfile
+
+# 2. UPDATED LANGCHAIN IMPORTS
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter  # FIXED LINE
 from langchain_community.vectorstores import Chroma
 from langchain.chains import RetrievalQAWithSourcesChain
 
@@ -62,7 +64,6 @@ def process_documents(uploaded_files, openai_api_key):
     all_docs = []
     try:
         for uploaded_file in uploaded_files:
-            # Create a temporary file that handles its own cleanup via context manager
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                 tmp_file.write(uploaded_file.getvalue())
                 tmp_path = tmp_file.name
@@ -70,10 +71,10 @@ def process_documents(uploaded_files, openai_api_key):
             try:
                 loader = PyPDFLoader(tmp_path)
                 docs = loader.load()
-                # Store original filename in metadata for better source tracking
                 for doc in docs:
                     doc.metadata["source"] = uploaded_file.name
                 
+                # Using the updated splitter package
                 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
                 splits = text_splitter.split_documents(docs)
                 all_docs.extend(splits)
@@ -82,7 +83,6 @@ def process_documents(uploaded_files, openai_api_key):
                     os.remove(tmp_path)
 
         embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-        # Use an ephemeral in-memory vectorstore to avoid file permission issues on cloud
         vectorstore = Chroma.from_documents(
             documents=all_docs, 
             embedding=embeddings,
@@ -96,10 +96,7 @@ def process_documents(uploaded_files, openai_api_key):
 # --- SIDEBAR ---
 with st.sidebar:
     st.title("⚙️ ENGINE CORE")
-    # API Key Handling (Check for environment variable or manual input)
     api_key = st.text_input("OpenAI API Key", type="password")
-    if not api_key:
-        api_key = os.getenv("OPENAI_API_KEY")
     
     st.divider()
     uploaded_files = st.file_uploader("Ingest Research Papers (PDF)", type="pdf", accept_multiple_files=True)
@@ -118,24 +115,20 @@ with st.sidebar:
 
 # --- MAIN INTERFACE ---
 st.title("⚡ AI KNOWLEDGE ENGINE")
-st.caption("Advanced Semantic Retrieval & Synthesis System")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display chat history
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Chat Input
 if prompt := st.chat_input("Query the knowledge base..."):
     if not api_key:
         st.error("Please enter an OpenAI API Key in the sidebar.")
     elif "vectorstore" not in st.session_state:
         st.error("Please upload and initialize documents first.")
     else:
-        # Add user message to history
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -144,8 +137,6 @@ if prompt := st.chat_input("Query the knowledge base..."):
             with st.spinner("Synthesizing response..."):
                 try:
                     llm = ChatOpenAI(model_name="gpt-4o", temperature=0, openai_api_key=api_key)
-                    
-                    # Setting up the chain
                     chain = RetrievalQAWithSourcesChain.from_chain_type(
                         llm=llm,
                         chain_type="stuff",
@@ -153,14 +144,11 @@ if prompt := st.chat_input("Query the knowledge base..."):
                     )
                     
                     response = chain.invoke({"question": prompt})
-                    
-                    answer = response.get('answer', "I couldn't find an answer.")
+                    answer = response.get('answer', "No answer found.")
                     sources = response.get('sources', '').strip()
                     
-                    full_response = f"{answer}\n\n**SOURCES:**\n{sources if sources else 'No specific source identified.'}"
-                    st.markdown(full_response)
-                    
-                    # Save assistant message to history
-                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                    full_res = f"{answer}\n\n**SOURCES:**\n{sources if sources else 'N/A'}"
+                    st.markdown(full_res)
+                    st.session_state.messages.append({"role": "assistant", "content": full_res})
                 except Exception as e:
                     st.error(f"Engine Error: {str(e)}")
