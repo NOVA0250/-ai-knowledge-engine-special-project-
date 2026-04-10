@@ -1,3 +1,8 @@
+__import__('pysqlite3')
+import sys
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
+# ... the rest of your imports (streamlit, os, etc.) follow below ...
 import streamlit as st
 import os
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
