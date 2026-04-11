@@ -2,7 +2,6 @@ import streamlit as st
 import os
 import tempfile
 
-import openai
 import faiss
 import numpy as np
 import pypdf
@@ -23,7 +22,8 @@ h1, h2, h3 {
     background-color: #111114;
     border-right: 1px solid #7000ff;
 }
-.stTextInput > div > div > input {
+.stTextInput > div > div > input,
+.stSelectbox > div > div {
     background-color: #1a1a1e;
     color: #00f2ff;
     border: 1px solid #7000ff;
@@ -47,11 +47,129 @@ h1, h2, h3 {
 """, unsafe_allow_html=True)
 
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
+# ── PROVIDER CONFIG ───────────────────────────────────────────────────────────
 
-MAX_CHARS_PER_CHUNK = 6000   # ~1500 tokens, well within embedding model limits
+PROVIDERS = {
+    "OpenAI":        {"models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"], "has_embed": True},
+    "Anthropic":     {"models": ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"], "has_embed": False},
+    "Google Gemini": {"models": ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"], "has_embed": True},
+    "Groq":          {"models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"], "has_embed": False},
+}
 
-def extract_pages(file_bytes, filename):
+NEEDS_EMBED_KEY = {"Anthropic", "Groq"}
+
+
+# ── EMBEDDINGS ────────────────────────────────────────────────────────────────
+
+def embed_openai(texts, api_key):
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+    clean = [t.replace("\n", " ").strip() or " " for t in texts]
+    resp = client.embeddings.create(model="text-embedding-3-small", input=clean)
+    return np.array([d.embedding for d in resp.data], dtype="float32")
+
+
+def embed_google(texts, api_key):
+    """Embed texts one-by-one using Google's text-embedding-004 model."""
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+    vecs = []
+    for t in texts:
+        clean = t.replace("\n", " ").strip() or " "
+        result = genai.embed_content(
+            model="models/text-embedding-004",
+            content=clean,
+            task_type="retrieval_document",
+        )
+        vecs.append(result["embedding"])
+    return np.array(vecs, dtype="float32")
+
+
+def get_embeddings(texts, provider, api_key, embed_key=None):
+    if provider in NEEDS_EMBED_KEY:
+        return embed_openai(texts, embed_key)
+    elif provider == "Google Gemini":
+        return embed_google(texts, api_key)
+    else:
+        return embed_openai(texts, api_key)
+
+
+# ── CHAT ──────────────────────────────────────────────────────────────────────
+
+def chat_openai(query, ctx, api_key, model):
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=model, temperature=0,
+        messages=[
+            {"role": "system", "content":
+             "Answer using ONLY the context below. "
+             "If the answer isn't there, say so.\n\nCONTEXT:\n" + ctx},
+            {"role": "user", "content": query},
+        ],
+    )
+    return resp.choices[0].message.content
+
+
+def chat_anthropic(query, ctx, api_key, model):
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model=model, max_tokens=1024, temperature=0,
+        system="Answer using ONLY the context below. If the answer isn't there, say so.\n\nCONTEXT:\n" + ctx,
+        messages=[{"role": "user", "content": query}],
+    )
+    return resp.content[0].text
+
+
+def chat_google(query, ctx, api_key, model):
+    """Use Gemini for chat — context injected directly into the prompt."""
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+    m = genai.GenerativeModel(model_name=model)
+    # Inject context directly into the user prompt (avoids system_instruction issues)
+    full_prompt = (
+        "You are a precise research assistant. "
+        "Answer using ONLY the context below. "
+        "If the answer is not in the context, say so clearly.\n\n"
+        f"CONTEXT:\n{ctx}\n\n"
+        f"QUESTION:\n{query}"
+    )
+    resp = m.generate_content(full_prompt)
+    return resp.text
+
+
+def chat_groq(query, ctx, api_key, model):
+    from groq import Groq
+    client = Groq(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=model, temperature=0,
+        messages=[
+            {"role": "system", "content":
+             "Answer using ONLY the context below. "
+             "If the answer isn't there, say so.\n\nCONTEXT:\n" + ctx},
+            {"role": "user", "content": query},
+        ],
+    )
+    return resp.choices[0].message.content
+
+
+def get_answer(query, docs, provider, api_key, model):
+    ctx = "\n\n---\n\n".join(
+        f"[{d['source']} | p.{d['page']}]\n{d['text']}" for d in docs
+    )
+    dispatch = {
+        "OpenAI":        chat_openai,
+        "Anthropic":     chat_anthropic,
+        "Google Gemini": chat_google,
+        "Groq":          chat_groq,
+    }
+    return dispatch[provider](query, ctx, api_key, model)
+
+
+# ── PDF + INDEXING ────────────────────────────────────────────────────────────
+
+def extract_chunks(file_bytes, filename):
     chunks, meta = [], []
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
         f.write(file_bytes)
@@ -66,8 +184,7 @@ def extract_pages(file_bytes, filename):
             start = 0
             while start < len(text):
                 piece = text[start:start + size].strip()
-                # skip empty or oversized pieces
-                if piece and len(piece) <= MAX_CHARS_PER_CHUNK:
+                if piece and len(piece) <= 6000:
                     chunks.append(piece)
                     meta.append({"source": filename, "page": i + 1})
                 start += size - overlap
@@ -76,31 +193,10 @@ def extract_pages(file_bytes, filename):
     return chunks, meta
 
 
-def embed(texts, client):
-    """Embed a batch of texts. Returns float32 numpy array."""
-    # Sanitise: replace newlines (OpenAI recommendation) and ensure non-empty
-    clean = [t.replace("\n", " ").strip() for t in texts]
-    clean = [t if t else " " for t in clean]   # never send empty string
-    try:
-        resp = client.embeddings.create(
-            model="text-embedding-3-small",
-            input=clean,
-        )
-        return np.array([d.embedding for d in resp.data], dtype="float32")
-    except openai.AuthenticationError:
-        raise
-    except openai.RateLimitError:
-        raise RuntimeError("OpenAI rate limit hit — wait a moment and try again.")
-    except openai.BadRequestError as e:
-        raise RuntimeError(f"OpenAI rejected the request: {e}")
-    except Exception as e:
-        raise RuntimeError(f"Embedding error: {e}")
-
-
-def build_index(uploaded_files, client):
+def build_index(uploaded_files, provider, api_key, embed_key=None):
     all_chunks, all_meta = [], []
     for uf in uploaded_files:
-        c, m = extract_pages(uf.getvalue(), uf.name)
+        c, m = extract_chunks(uf.getvalue(), uf.name)
         all_chunks.extend(c)
         all_meta.extend(m)
 
@@ -108,12 +204,14 @@ def build_index(uploaded_files, client):
         st.error("No text could be extracted from the PDFs.")
         return None, None, None
 
-    st.info(f"Embedding {len(all_chunks)} chunks…")
+    st.info(f"Embedding {len(all_chunks)} chunks via {provider}…")
     vecs = []
-    batch_size = 100   # conservative batch to avoid payload limits
+    # Google embeds one-at-a-time inside embed_google, so batch=100 is fine for others
+    batch_size = 100
     progress = st.progress(0)
     for i in range(0, len(all_chunks), batch_size):
-        vecs.append(embed(all_chunks[i:i + batch_size], client))
+        batch = all_chunks[i:i + batch_size]
+        vecs.append(get_embeddings(batch, provider, api_key, embed_key))
         progress.progress(min((i + batch_size) / len(all_chunks), 1.0))
     progress.empty()
 
@@ -124,67 +222,76 @@ def build_index(uploaded_files, client):
     return index, all_chunks, all_meta
 
 
-def retrieve(query, index, chunks, meta, client, k=5):
-    q = embed([query], client)
+def retrieve(query, index, chunks, meta, provider, api_key, embed_key=None, k=5):
+    q = get_embeddings([query], provider, api_key, embed_key)
     faiss.normalize_L2(q)
     _, ids = index.search(q, k)
     return [{"text": chunks[i], **meta[i]} for i in ids[0] if i != -1]
-
-
-def answer(query, docs, client):
-    ctx = "\n\n---\n\n".join(
-        f"[{d['source']} | p.{d['page']}]\n{d['text']}" for d in docs
-    )
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        temperature=0,
-        messages=[
-            {"role": "system", "content":
-                "You are a precise research assistant. "
-                "Answer using ONLY the context below. "
-                "If the answer isn't there, say so.\n\nCONTEXT:\n" + ctx},
-            {"role": "user", "content": query},
-        ],
-    )
-    return resp.choices[0].message.content
 
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ ENGINE CORE")
 
-    default_key = ""
-    try:
-        default_key = st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:
-        pass
+    provider = st.selectbox("AI Provider", list(PROVIDERS.keys()))
+    model = st.selectbox("Model", PROVIDERS[provider]["models"])
 
-    api_key = st.text_input("OpenAI API Key", value=default_key, type="password")
+    def get_secret(key):
+        try:
+            return st.secrets.get(key, "")
+        except Exception:
+            return ""
+
+    secret_key_map = {
+        "OpenAI":        "OPENAI_API_KEY",
+        "Anthropic":     "ANTHROPIC_API_KEY",
+        "Google Gemini": "GOOGLE_API_KEY",
+        "Groq":          "GROQ_API_KEY",
+    }
+
+    api_key = st.text_input(
+        f"{provider} API Key",
+        value=get_secret(secret_key_map[provider]),
+        type="password",
+    )
+
+    embed_key = None
+    if provider in NEEDS_EMBED_KEY:
+        st.caption("⚠️ This provider has no embedding API. An OpenAI key is needed for document indexing.")
+        embed_key = st.text_input(
+            "OpenAI API Key (for embeddings)",
+            value=get_secret("OPENAI_API_KEY"),
+            type="password",
+        )
+
     st.divider()
     uploaded_files = st.file_uploader(
         "Ingest Research Papers (PDF)", type="pdf", accept_multiple_files=True
     )
 
     if st.button("INITIALIZE ENGINE"):
+        missing = []
         if not api_key:
-            st.error("Enter API Key.")
-        elif not uploaded_files:
-            st.error("Upload at least one PDF.")
+            missing.append(f"{provider} API Key")
+        if provider in NEEDS_EMBED_KEY and not embed_key:
+            missing.append("OpenAI API Key (embeddings)")
+        if not uploaded_files:
+            missing.append("at least one PDF")
+
+        if missing:
+            st.error("Missing: " + ", ".join(missing))
         else:
             try:
-                client = openai.OpenAI(api_key=api_key)
-                idx, chunks, meta = build_index(uploaded_files, client)
+                idx, chunks, meta = build_index(uploaded_files, provider, api_key, embed_key)
                 if idx is not None:
                     st.session_state.update(
-                        index=idx, chunks=chunks, meta=meta, api_key=api_key
+                        index=idx, chunks=chunks, meta=meta,
+                        api_key=api_key, embed_key=embed_key,
+                        provider=provider, model=model,
                     )
                     st.success(f"Indexed {len(chunks)} chunks from {len(uploaded_files)} file(s).")
-            except openai.AuthenticationError:
-                st.error("Invalid API key — double-check it and try again.")
-            except RuntimeError as e:
-                st.error(str(e))
             except Exception as e:
-                st.error(f"Unexpected error: {e}")
+                st.error(f"Indexing error: {e}")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 st.title("⚡ AI KNOWLEDGE ENGINE")
@@ -198,7 +305,7 @@ for msg in st.session_state.messages:
 
 if prompt := st.chat_input("Query the documents…"):
     if not api_key:
-        st.error("Enter your OpenAI API Key in the sidebar.")
+        st.error("Enter your API Key in the sidebar.")
     elif "index" not in st.session_state:
         st.error("Upload PDFs and click INITIALIZE ENGINE first.")
     else:
@@ -209,22 +316,24 @@ if prompt := st.chat_input("Query the documents…"):
         with st.chat_message("assistant"):
             with st.spinner("Synthesizing…"):
                 try:
-                    client = openai.OpenAI(api_key=st.session_state.api_key)
                     docs = retrieve(
                         prompt,
                         st.session_state.index,
                         st.session_state.chunks,
                         st.session_state.meta,
-                        client,
+                        st.session_state.provider,
+                        st.session_state.api_key,
+                        st.session_state.embed_key,
                     )
-                    ans = answer(prompt, docs, client)
+                    ans = get_answer(
+                        prompt, docs,
+                        st.session_state.provider,
+                        st.session_state.api_key,
+                        st.session_state.model,
+                    )
                     srcs = list({f"{d['source']} (p.{d['page']})" for d in docs})
                     full = ans + "\n\n**SOURCES:**\n" + "\n".join(f"- {s}" for s in srcs)
                     st.markdown(full)
                     st.session_state.messages.append({"role": "assistant", "content": full})
-                except openai.AuthenticationError:
-                    st.error("Invalid API key.")
-                except RuntimeError as e:
-                    st.error(str(e))
                 except Exception as e:
                     st.error(f"Error: {e}")
