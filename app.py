@@ -14,8 +14,8 @@ EMBED_MODEL = "gemini-embedding-001"   # ✅ FIXED
 FALLBACK_MODEL = "gemini-embedding-2-preview"
 CHAT_MODEL  = "gemini-2.0-flash"
 
-CHUNK_SIZE    = 800
-CHUNK_OVERLAP = 150
+CHUNK_SIZE    = 1200
+CHUNK_OVERLAP = 100
 EMBED_BATCH = 150
 TOP_K         = 5
 
