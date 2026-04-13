@@ -151,12 +151,43 @@ QUESTION:
 {query}
 """
 
-    response = client.models.generate_content(
-        model=CHAT_MODEL,
-        contents=prompt
-    )
+    import time
 
-    return response.text
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=CHAT_MODEL,
+                contents=prompt
+            )
+
+            # ✅ SAFE RETURN
+            if hasattr(response, "text") and response.text:
+                return response.text
+            else:
+                return "⚠️ No response generated."
+
+        except Exception as e:
+            err = str(e)
+
+            # 🔥 HANDLE QUOTA ERROR
+            if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                wait_time = 5 * (attempt + 1)
+                time.sleep(wait_time)
+                continue
+
+            # 🔥 HANDLE INVALID KEY / PERMISSION
+            elif "401" in err or "403" in err:
+                return "❌ Invalid API key or permission issue."
+
+            # 🔥 HANDLE MODEL NOT FOUND
+            elif "404" in err:
+                return "❌ Model not available. Check model name."
+
+            # 🔥 UNKNOWN ERROR
+            else:
+                return f"❌ Error: {err}"
+
+    return "⚠️ Quota exceeded. Try again later."
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
