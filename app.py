@@ -203,7 +203,7 @@ hr { border: none !important; border-top: 1px solid var(--border) !important; ma
 
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-EMBED_MODEL = "text-embedding-004"   # no "models/" prefix with new SDK
+EMBED_MODEL = "models/embedding-001"   # no "models/" prefix with new SDK
 CHAT_MODEL  = "gemini-2.0-flash"
 CHUNK_SIZE    = 800
 CHUNK_OVERLAP = 150
