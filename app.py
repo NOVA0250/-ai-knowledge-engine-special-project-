@@ -18,16 +18,15 @@ except:
 
 # ── CONFIG ─────────────────────────────────────────────────────
 CHAT_MODEL = "gpt-4o-mini"
-TOP_K = 10   # get more → rerank later
+TOP_K = 20
 
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 100
 
 
-# ── PAGE CONFIG ────────────────────────────────────────────────
+# ── UI ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="Neural Knowledge Engine", layout="wide")
 
-# ── UI ─────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 body {background:#050507;color:#d1d5db;}
@@ -39,12 +38,12 @@ body {background:#050507;color:#d1d5db;}
 st.markdown("<h1 style='text-align:center;'>⚡ Neural Knowledge Engine</h1>", unsafe_allow_html=True)
 
 
-# ── LOAD MODELS ────────────────────────────────────────────────
+# ── LOAD MODEL ─────────────────────────────────────────────────
 @st.cache_resource
-def load_models():
+def load_model():
     return SentenceTransformer("BAAI/bge-small-en-v1.5")
 
-embed_model = load_models()
+embed_model = load_model()
 
 if USE_OPENAI:
     try:
@@ -107,22 +106,34 @@ def build_index(files):
     return index, all_chunks, all_meta, vectorizer, tfidf_matrix
 
 
-# ── RETRIEVE ───────────────────────────────────────────────────
+# ── HYBRID RETRIEVE ────────────────────────────────────────────
 def retrieve(query, index, chunks, meta, vectorizer, tfidf_matrix):
     q_vec = embed_model.encode([query]).astype("float32")
     faiss.normalize_L2(q_vec)
 
-    _, sem_ids = index.search(q_vec, 20)
+    _, sem_ids = index.search(q_vec, TOP_K)
 
     q_tfidf = vectorizer.transform([query])
     scores = (tfidf_matrix @ q_tfidf.T).toarray().ravel()
-    kw_ids = np.argsort(scores)[::-1][:20]
+    kw_ids = np.argsort(scores)[::-1][:TOP_K]
 
     combined = list(set(sem_ids[0]) | set(kw_ids))
 
     docs = [{"text": chunks[i], **meta[i]} for i in combined if i != -1]
 
     return docs
+
+
+# ── FILTER ─────────────────────────────────────────────────────
+def filter_docs(query, docs):
+    keywords = query.lower().split()
+
+    filtered = [
+        d for d in docs
+        if any(k in d["text"].lower() for k in keywords)
+    ]
+
+    return filtered if filtered else docs
 
 
 # ── RERANK ─────────────────────────────────────────────────────
@@ -139,29 +150,33 @@ def rerank(query, docs):
     return [d for _, d in scored[:5]]
 
 
-# ── COMPRESS CONTEXT ───────────────────────────────────────────
-def compress_context(query, docs):
-    keywords = query.lower().split()
+# ── SMART LOCAL ANSWER (KEY UPGRADE) ───────────────────────────
+def local_answer(query, docs):
+    query_words = set(query.lower().split())
 
-    refined = []
+    scored_sentences = []
+
     for d in docs:
         sentences = d["text"].split(".")
-        best = [s for s in sentences if any(k in s.lower() for k in keywords)]
-        refined.append(" ".join(best[:2]))
+        for s in sentences:
+            s_lower = s.lower()
 
-    return refined
+            score = sum(1 for w in query_words if w in s_lower)
 
+            if score > 0:
+                scored_sentences.append((score, s.strip()))
 
-# ── LOCAL ANSWER ───────────────────────────────────────────────
-def local_answer(query, docs):
-    text = "\n\n".join(d["text"] for d in docs[:2])
+    scored_sentences.sort(reverse=True, key=lambda x: x[0])
+
+    selected = [s for _, s in scored_sentences[:5]]
+
+    if not selected:
+        return "⚠️ No precise answer found."
 
     return f"""
-📌 Answer (Local Intelligence Mode):
+📌 Answer:
 
-{text[:600]}
-
-🔎 Based on retrieved context.
+{" ".join(selected)}
 """
 
 
@@ -177,17 +192,21 @@ def openai_answer(prompt):
 
 # ── GENERATE ANSWER ────────────────────────────────────────────
 def generate_answer(query, docs):
+    docs = filter_docs(query, docs)
     docs = rerank(query, docs)
-    compressed = compress_context(query, docs)
 
-    context = "\n\n".join(compressed)
+    context = "\n\n".join(d["text"] for d in docs[:3])
 
     prompt = f"""
-Answer clearly using context:
+Answer the question directly in 2-4 lines.
+Do not repeat context.
+Be precise.
 
+Context:
 {context}
 
-Question: {query}
+Question:
+{query}
 """
 
     if USE_OPENAI:
