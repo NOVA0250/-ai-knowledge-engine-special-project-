@@ -452,37 +452,65 @@ def refine_context(query: str, docs: list[dict]) -> str:
 
 # ── ANSWER GENERATION ─────────────────────────────────────────────────────────
 
-def answer_pdf(query: str, store: dict, llm: dict) -> tuple[str, list[dict]]:
+def answer_pdf(query: str, store: dict, llm: dict) -> tuple[str, list[dict], bool]:
+    """Returns (answer_text, docs, used_llm). Never raises — falls back locally."""
     docs = retrieve_pdf(query, store)
     if not docs:
-        return "No relevant information found in the uploaded documents.", []
-
+        return "No relevant information found in the uploaded documents.", [], False
     context = refine_context(query, docs)
     prompt = (
         "You are a precise, expert research assistant.\n"
         "Answer the question using ONLY the context provided below.\n"
         "Be thorough but concise. Use markdown formatting where helpful.\n"
         "If the answer is not found in the context, clearly state that.\n\n"
-        f"CONTEXT:\n{context}\n\n"
-        f"QUESTION: {query}"
+        f"CONTEXT:\n{context}\n\nQUESTION: {query}"
     )
-    return llm_complete(llm, prompt), docs
+    try:
+        return llm_complete(llm, prompt), docs, True
+    except Exception as e:
+        if _is_rate_limit(str(e)):
+            return local_fallback_answer(query, docs), docs, False
+        raise   # re-raise non-rate-limit errors
+
+
+def csv_local_answer(query: str, df: pd.DataFrame) -> str:
+    """Answer CSV questions with pure pandas — zero API calls."""
+    q = query.lower()
+    try:
+        if any(w in q for w in ("shape", "size", "rows", "columns", "how many")):
+            return f"**Dataset shape:** {df.shape[0]:,} rows × {df.shape[1]} columns\n\n**Columns:** {', '.join(df.columns)}"
+        if any(w in q for w in ("describe", "summary", "statistics", "stats")):
+            return "**Statistical summary:**\n\n" + df.describe().to_markdown()
+        if any(w in q for w in ("missing", "null", "nan", "empty")):
+            nulls = df.isnull().sum()
+            nulls = nulls[nulls > 0]
+            if nulls.empty:
+                return "✅ No missing values found."
+            return "**Missing values per column:**\n\n" + nulls.to_markdown()
+        if any(w in q for w in ("head", "first", "top", "preview", "show", "sample")):
+            n = 5
+            for word in q.split():
+                if word.isdigit():
+                    n = min(int(word), 20)
+                    break
+            return f"**First {n} rows:**\n\n" + df.head(n).to_markdown(index=False)
+        if "column" in q or "feature" in q:
+            return f"**Columns ({len(df.columns)}):** {', '.join(df.columns)}"
+        # fallback: return head
+        return "**Dataset preview (first 5 rows):**\n\n" + df.head(5).to_markdown(index=False)
+    except Exception as e:
+        return f"⚠️ Local data analysis error: {e}"
 
 
 def answer_csv(query: str, df: pd.DataFrame, llm: dict) -> str:
-    # Send column names + first 3 rows as sample so the LLM understands structure
-    sample = df.head(3).to_string(index=False)
+    """Try LLM-generated pandas code; fall back to local logic on any failure."""
     cols   = ", ".join(df.columns.tolist())
-
+    sample = df.head(3).to_string(index=False)
     prompt = (
-        "You are a data analyst assistant. The user has a pandas DataFrame called `df`.\n"
-        f"Columns: {cols}\n"
-        f"Sample rows:\n{sample}\n\n"
-        "Write Python/pandas code to answer the user's question.\n"
-        "Rules:\n"
-        "- Store the final answer in a variable called `result`\n"
-        "- `result` must be a string, number, or DataFrame\n"
-        "- Output ONLY valid Python code, no explanation, no markdown fences\n\n"
+        "You are a data analyst. The user has a pandas DataFrame `df`.\n"
+        f"Columns: {cols}\nSample rows:\n{sample}\n\n"
+        "Write Python/pandas code to answer the question.\n"
+        "Rules: store result in `result`, output ONLY raw Python, no fences.\n\n"
         f"Question: {query}"
     )
     try:
@@ -490,12 +518,16 @@ def answer_csv(query: str, df: pd.DataFrame, llm: dict) -> str:
         code = code.replace("```python", "").replace("```", "").strip()
         local_vars = {"df": df.copy(), "pd": pd}
         exec(code, {}, local_vars)
-        result = local_vars.get("result", "No result computed.")
+        result = local_vars.get("result", None)
+        if result is None:
+            return csv_local_answer(query, df)
         if isinstance(result, pd.DataFrame):
             return result.to_markdown(index=False)
         return str(result)
     except Exception as e:
-        return f"⚠️ Could not execute generated code: {e}\n\nGenerated code:\n```python\n{code}\n```"
+        if _is_rate_limit(str(e)):
+            return csv_local_answer(query, df)
+        return csv_local_answer(query, df)   # always fall back, never error
 
 
 # ── ERROR HELPER ──────────────────────────────────────────────────────────────
@@ -504,8 +536,6 @@ def friendly_error(err: str) -> str:
     e = err.lower()
     if "401" in e or "403" in e or "invalid_api_key" in e or "api key" in e:
         return "❌ Invalid API key. Double-check it and try again."
-    if "429" in e or "quota" in e or "resource_exhausted" in e or "rate" in e:
-        return "⏱ Rate limit hit. Wait 30–60 seconds and try again."
     if "404" in e and "model" in e:
         return f"❌ Model not found. Check your API key has access to the model.\n\n`{err}`"
     if "connection" in e or "timeout" in e:
@@ -761,24 +791,24 @@ if prompt := st.chat_input(placeholder, disabled=not is_ready):
         with st.chat_message("assistant"):
             with st.spinner("Synthesizing…"):
                 try:
-                    llm       = get_llm(st.session_state.provider, st.session_state.api_key)
-                    docs      = []
-                    mode_used = "none"
+                    llm  = get_llm(st.session_state.provider, st.session_state.api_key)
+                    docs = []
 
                     # Route: CSV takes priority if both loaded and query looks data-like
                     data_keywords = {"average","mean","max","min","count","sum","total",
                                      "how many","list","show","top","bottom","filter",
-                                     "where","group","column","row","table","dataset"}
+                                     "where","group","column","row","table","dataset",
+                                     "describe","shape","rows","columns","head","sample"}
                     looks_like_data = any(kw in prompt.lower() for kw in data_keywords)
 
                     if is_csv_ready and (looks_like_data or not is_pdf_ready):
+                        # answer_csv never raises — always returns a string
                         ans = answer_csv(prompt, st.session_state.csv_df, llm)
-                        mode_used = "csv"
                     elif is_pdf_ready:
-                        ans, docs = answer_pdf(prompt, st.session_state.pdf_store, llm)
-                        mode_used = "pdf"
+                        # answer_pdf never raises — falls back locally on rate limit
+                        ans, docs, _ = answer_pdf(prompt, st.session_state.pdf_store, llm)
                     else:
-                        ans, mode_used = "No data loaded.", "none"
+                        ans = "⚠️ No data loaded. Upload and initialize first."
 
                     # Build source pills for PDF answers
                     src_html = ""
@@ -790,9 +820,9 @@ if prompt := st.chat_input(placeholder, disabled=not is_ready):
                                 seen.add(label)
                                 src_html += f'<span class="source-pill">📄 {label}</span>'
                         src_html = (
-                            f'<div style="margin-top:14px;">'
-                            f'<span style="font-size:.65rem;color:var(--dim);letter-spacing:1.5px;'
-                            f'text-transform:uppercase;">Sources</span><br>{src_html}</div>'
+                            '<div style="margin-top:14px;">'
+                            '<span style="font-size:.65rem;color:var(--dim);letter-spacing:1.5px;'
+                            'text-transform:uppercase;">Sources</span><br>' + src_html + '</div>'
                         )
 
                     full = ans + ("\n\n" + src_html if src_html else "")
@@ -800,18 +830,8 @@ if prompt := st.chat_input(placeholder, disabled=not is_ready):
                     st.session_state.messages.append({"role": "assistant", "content": full})
 
                 except Exception as e:
-                    err = str(e)
-                    if _is_rate_limit(err) and mode_used in ("pdf", "none"):
-                        # Instant local fallback — never hang on retries
-                        if not docs and "pdf_store" in st.session_state:
-                            docs = retrieve_pdf(prompt, st.session_state.pdf_store)
-                        fallback = local_fallback_answer(prompt, docs)
-                        st.markdown(fallback)
-                        st.session_state.messages.append(
-                            {"role": "assistant", "content": fallback}
-                        )
-                    else:
-                        st.error(friendly_error(err))
+                    # Only genuine errors (bad key, network, etc.) reach here
+                    st.error(friendly_error(str(e)))
 
 # ── CLEAR CHAT ──
 if st.session_state.get("messages"):
