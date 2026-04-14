@@ -296,26 +296,66 @@ def get_llm(provider: str, api_key: str):
         return {"provider": "openai", "client": client}
 
 
-def llm_complete(llm: dict, prompt: str) -> str:
-    """Send a prompt and return the text response."""
-    if llm["provider"] == "gemini":
-        resp = llm["client"].models.generate_content(
-            model="gemini-2.0-flash", contents=prompt
-        )
-        return resp.text
+def llm_complete(llm: dict, prompt: str, max_retries: int = 3) -> str:
+    """Send a prompt with automatic retry + exponential backoff on rate limits."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            if llm["provider"] == "gemini":
+                resp = llm["client"].models.generate_content(
+                    model="gemini-2.0-flash", contents=prompt
+                )
+                return resp.text
+            else:
+                resp = llm["client"].chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return resp.choices[0].message.content
+        except Exception as e:
+            last_err = str(e)
+            is_rate = any(k in last_err.lower() for k in
+                          ("429", "quota", "rate", "resource_exhausted", "too many"))
+            if is_rate and attempt < max_retries - 1:
+                wait = 20 * (attempt + 1)   # 20s, 40s
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(last_err)
+
+
+def local_fallback_answer(query: str, docs: list) -> str:
+    """Return a structured answer from raw chunks — no API needed."""
+    if not docs:
+        return "No relevant information found in the uploaded documents."
+    qwords = set(query.lower().split())
+    scored = []
+    for d in docs:
+        for sent in d["text"].split("."):
+            s = sent.strip()
+            if not s:
+                continue
+            hit = sum(1 for w in qwords if w in s.lower())
+            if hit > 0:
+                scored.append((hit, s))
+    scored.sort(reverse=True)
+    best = [s for _, s in scored[:6]]
+    if best:
+        body = "\n\n".join(f"• {s}." for s in best)
     else:
-        resp = llm["client"].chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.choices[0].message.content
+        body = "\n\n".join(d["text"][:400] for d in docs[:3])
+    return (
+        f"**Best matching content** *(local mode — LLM unavailable)*\n\n{body}\n\n"
+        f"> ⚠️ API rate limit reached. Showing raw matched content. "
+        f"Wait ~60s and retry for an AI-synthesised answer."
+    )
 
 
 def validate_key(provider: str, api_key: str) -> str | None:
-    """Quick validation call. Returns error string or None if OK."""
+    """Quick validation — returns error string or None if OK."""
     try:
         llm = get_llm(provider, api_key)
-        llm_complete(llm, "hi")
+        llm_complete(llm, "Reply with the single word OK.", max_retries=1)
         return None
     except Exception as e:
         return str(e)
@@ -711,8 +751,9 @@ if prompt := st.chat_input(placeholder, disabled=not is_ready):
         with st.chat_message("assistant"):
             with st.spinner("Synthesizing…"):
                 try:
-                    llm  = get_llm(st.session_state.provider, st.session_state.api_key)
-                    docs = []
+                    llm       = get_llm(st.session_state.provider, st.session_state.api_key)
+                    docs      = []
+                    mode_used = "none"
 
                     # Route: CSV takes priority if both loaded and query looks data-like
                     data_keywords = {"average","mean","max","min","count","sum","total",
@@ -749,7 +790,26 @@ if prompt := st.chat_input(placeholder, disabled=not is_ready):
                     st.session_state.messages.append({"role": "assistant", "content": full})
 
                 except Exception as e:
-                    st.error(friendly_error(str(e)))
+                    err = str(e)
+                    is_rate = any(k in err.lower() for k in
+                                  ("429", "quota", "rate", "resource_exhausted", "too many"))
+                    if is_rate and mode_used == "pdf" and docs:
+                        # Graceful local fallback — no API needed
+                        fallback = local_fallback_answer(prompt, docs)
+                        st.markdown(fallback)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": fallback}
+                        )
+                    elif is_rate and mode_used == "pdf":
+                        # Retrieve was fine, generation failed — do local anyway
+                        docs2 = retrieve_pdf(prompt, st.session_state.pdf_store)
+                        fallback = local_fallback_answer(prompt, docs2)
+                        st.markdown(fallback)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": fallback}
+                        )
+                    else:
+                        st.error(friendly_error(err))
 
 # ── CLEAR CHAT ──
 if st.session_state.get("messages"):
