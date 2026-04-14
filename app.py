@@ -4,6 +4,7 @@ import tempfile
 import numpy as np
 import faiss
 import pypdf
+import pandas as pd
 
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -19,12 +20,9 @@ except:
 # ── CONFIG ─────────────────────────────────────────────────────
 CHAT_MODEL = "gpt-4o-mini"
 TOP_K = 20
-
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 100
 
-
-# ── UI ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="Neural Knowledge Engine", layout="wide")
 
 st.markdown("""
@@ -52,7 +50,7 @@ if USE_OPENAI:
         USE_OPENAI = False
 
 
-# ── CHUNKING ───────────────────────────────────────────────────
+# ── PDF PROCESSING ─────────────────────────────────────────────
 def extract_chunks(file_bytes, filename):
     chunks, meta = [], []
 
@@ -80,7 +78,6 @@ def extract_chunks(file_bytes, filename):
     return chunks, meta
 
 
-# ── BUILD INDEX ────────────────────────────────────────────────
 def build_index(files):
     all_chunks, all_meta = [], []
 
@@ -89,14 +86,9 @@ def build_index(files):
         all_chunks.extend(c)
         all_meta.extend(m)
 
-    if len(all_chunks) > 200:
-        all_chunks = all_chunks[:200]
-        all_meta = all_meta[:200]
-
-    embeddings = embed_model.encode(all_chunks)
-    embeddings = np.array(embeddings).astype("float32")
-
+    embeddings = embed_model.encode(all_chunks).astype("float32")
     faiss.normalize_L2(embeddings)
+
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
 
@@ -106,7 +98,7 @@ def build_index(files):
     return index, all_chunks, all_meta, vectorizer, tfidf_matrix
 
 
-# ── HYBRID RETRIEVE ────────────────────────────────────────────
+# ── RETRIEVE + RERANK ──────────────────────────────────────────
 def retrieve(query, index, chunks, meta, vectorizer, tfidf_matrix):
     q_vec = embed_model.encode([query]).astype("float32")
     faiss.normalize_L2(q_vec)
@@ -118,25 +110,11 @@ def retrieve(query, index, chunks, meta, vectorizer, tfidf_matrix):
     kw_ids = np.argsort(scores)[::-1][:TOP_K]
 
     combined = list(set(sem_ids[0]) | set(kw_ids))
-
     docs = [{"text": chunks[i], **meta[i]} for i in combined if i != -1]
 
     return docs
 
 
-# ── FILTER ─────────────────────────────────────────────────────
-def filter_docs(query, docs):
-    keywords = query.lower().split()
-
-    filtered = [
-        d for d in docs
-        if any(k in d["text"].lower() for k in keywords)
-    ]
-
-    return filtered if filtered else docs
-
-
-# ── RERANK ─────────────────────────────────────────────────────
 def rerank(query, docs):
     q_vec = embed_model.encode([query])[0]
 
@@ -150,34 +128,21 @@ def rerank(query, docs):
     return [d for _, d in scored[:5]]
 
 
-# ── SMART LOCAL ANSWER (KEY UPGRADE) ───────────────────────────
+# ── SMART LOCAL ANSWER ─────────────────────────────────────────
 def local_answer(query, docs):
     query_words = set(query.lower().split())
-
     scored_sentences = []
 
     for d in docs:
-        sentences = d["text"].split(".")
-        for s in sentences:
-            s_lower = s.lower()
-
-            score = sum(1 for w in query_words if w in s_lower)
-
+        for s in d["text"].split("."):
+            score = sum(1 for w in query_words if w in s.lower())
             if score > 0:
                 scored_sentences.append((score, s.strip()))
 
-    scored_sentences.sort(reverse=True, key=lambda x: x[0])
-
+    scored_sentences.sort(reverse=True)
     selected = [s for _, s in scored_sentences[:5]]
 
-    if not selected:
-        return "⚠️ No precise answer found."
-
-    return f"""
-📌 Answer:
-
-{" ".join(selected)}
-"""
+    return "📌 Answer:\n\n" + " ".join(selected) if selected else "⚠️ No answer found."
 
 
 # ── OPENAI ANSWER ──────────────────────────────────────────────
@@ -190,17 +155,12 @@ def openai_answer(prompt):
     return res.choices[0].message.content
 
 
-# ── GENERATE ANSWER ────────────────────────────────────────────
 def generate_answer(query, docs):
-    docs = filter_docs(query, docs)
     docs = rerank(query, docs)
-
     context = "\n\n".join(d["text"] for d in docs[:3])
 
     prompt = f"""
-Answer the question directly in 2-4 lines.
-Do not repeat context.
-Be precise.
+Answer directly in 2-4 lines.
 
 Context:
 {context}
@@ -218,17 +178,63 @@ Question:
     return local_answer(query, docs)
 
 
+# ── DATA MODE (CSV INTELLIGENCE) ───────────────────────────────
+def data_answer(query, df):
+    q = query.lower()
+
+    try:
+        if "average salary" in q:
+            return f"Average salary: {df['salary'].mean():.2f}"
+
+        elif "max salary" in q:
+            return f"Max salary: {df['salary'].max()}"
+
+        elif "missing" in q:
+            return str(df.isnull().sum())
+
+        elif "duplicate" in q:
+            return str(df[df.duplicated()])
+
+        elif "top performer" in q:
+            return str(df.sort_values("performance_score", ascending=False).head(1))
+
+        elif "department" in q:
+            return str(df.groupby("department")["salary"].mean())
+
+        else:
+            return str(df.head())
+
+    except Exception as e:
+        return f"⚠️ Error: {e}"
+
+
 # ── SIDEBAR ────────────────────────────────────────────────────
-uploaded = st.sidebar.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
+uploaded = st.sidebar.file_uploader(
+    "Upload Files",
+    type=["pdf", "csv"],
+    accept_multiple_files=True
+)
 
 if st.sidebar.button("Initialize"):
-    idx, chunks, meta, vec, tfidf = build_index(uploaded)
+    pdfs, csvs = [], []
 
-    st.session_state.index = idx
-    st.session_state.chunks = chunks
-    st.session_state.meta = meta
-    st.session_state.vectorizer = vec
-    st.session_state.tfidf = tfidf
+    for f in uploaded:
+        if f.name.endswith(".pdf"):
+            pdfs.append(f)
+        elif f.name.endswith(".csv"):
+            csvs.append(f)
+
+    if pdfs:
+        idx, chunks, meta, vec, tfidf = build_index(pdfs)
+        st.session_state.index = idx
+        st.session_state.chunks = chunks
+        st.session_state.meta = meta
+        st.session_state.vectorizer = vec
+        st.session_state.tfidf = tfidf
+
+    if csvs:
+        df = pd.concat([pd.read_csv(f) for f in csvs], ignore_index=True)
+        st.session_state.df = df
 
     st.sidebar.success("✅ Ready")
 
@@ -244,22 +250,26 @@ for m in st.session_state.messages:
 if prompt := st.chat_input("Ask something..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    docs = retrieve(
-        prompt,
-        st.session_state.index,
-        st.session_state.chunks,
-        st.session_state.meta,
-        st.session_state.vectorizer,
-        st.session_state.tfidf
-    )
-
     with st.chat_message("assistant"):
         with st.spinner("⚡ Thinking..."):
-            ans = generate_answer(prompt, docs)
-            st.markdown(ans)
 
-            if docs:
-                sources = set([f"{d['source']} p.{d['page']}" for d in docs[:5]])
-                st.markdown("<br>".join([f"📄 {s}" for s in sources]), unsafe_allow_html=True)
+            if "df" in st.session_state:
+                ans = data_answer(prompt, st.session_state.df)
+
+            elif "index" in st.session_state:
+                docs = retrieve(
+                    prompt,
+                    st.session_state.index,
+                    st.session_state.chunks,
+                    st.session_state.meta,
+                    st.session_state.vectorizer,
+                    st.session_state.tfidf
+                )
+                ans = generate_answer(prompt, docs)
+
+            else:
+                ans = "⚠️ Upload and initialize files first."
+
+            st.markdown(ans)
 
     st.session_state.messages.append({"role": "assistant", "content": ans})
