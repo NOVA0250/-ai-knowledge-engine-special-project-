@@ -1,9 +1,7 @@
 streamlit
-PyPDF2
+pypdf
 sentence-transformers
 faiss-cpu
-groq
-qdrant-client
+numpy
 rank-bm25
-tiktoken
-numpy<2.0.0
+groq
