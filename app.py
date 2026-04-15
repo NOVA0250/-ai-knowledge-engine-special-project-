@@ -1,35 +1,26 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# ⚡ Neural Knowledge Engine (HYBRID: FAISS + BM25)
-# ─────────────────────────────────────────────────────────────────────────────
-
 import streamlit as st
-import tempfile, os, time
+import tempfile, os
 import numpy as np
-import pandas as pd
 import pypdf
 
-# ── HYBRID SEARCH IMPORTS ──
-import faiss
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-# ── CONFIG ───────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Neural Knowledge Engine ⚡", layout="wide")
+# ─────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────
+st.set_page_config(page_title="⚡ Neural Knowledge Engine", layout="wide")
 
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 150
-TOP_K = 8
-MAX_CHUNKS = 400
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
+TOP_K = 6
 
-# ── EMBEDDING MODEL ──
-EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 # PDF PROCESSING
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_chunks(file_bytes: bytes, filename: str):
+# ─────────────────────────────────────────────────────────
+def extract_chunks(file_bytes, filename):
     chunks, meta = [], []
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
         f.write(file_bytes)
         tmp = f.name
@@ -37,17 +28,17 @@ def extract_chunks(file_bytes: bytes, filename: str):
     try:
         reader = pypdf.PdfReader(tmp)
         for page_num, page in enumerate(reader.pages):
-            raw = (page.extract_text() or "").strip()
-            if not raw:
+            text = (page.extract_text() or "").strip()
+            if not text:
                 continue
 
-            text = " ".join(raw.split())
-            start = 0
+            text = " ".join(text.split())
 
+            start = 0
             while start < len(text):
-                piece = text[start:start+CHUNK_SIZE].strip()
-                if len(piece) > 80:
-                    chunks.append(piece)
+                chunk = text[start:start+CHUNK_SIZE]
+                if len(chunk) > 80:
+                    chunks.append(chunk)
                     meta.append({"source": filename, "page": page_num + 1})
                 start += CHUNK_SIZE - CHUNK_OVERLAP
 
@@ -56,72 +47,55 @@ def extract_chunks(file_bytes: bytes, filename: str):
 
     return chunks, meta
 
+# ─────────────────────────────────────────────────────────
+# HYBRID INDEX (BM25 + TF-IDF)
+# ─────────────────────────────────────────────────────────
+def build_index(files):
+    chunks, meta = [], []
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HYBRID INDEX (FAISS + BM25)
-# ─────────────────────────────────────────────────────────────────────────────
+    for f in files:
+        c, m = extract_chunks(f.getvalue(), f.name)
+        chunks.extend(c)
+        meta.extend(m)
 
-def build_pdf_index(uploaded_files):
-    all_chunks, all_meta = [], []
-
-    for uf in uploaded_files:
-        c, m = extract_chunks(uf.getvalue(), uf.name)
-        all_chunks.extend(c)
-        all_meta.extend(m)
-
-    if not all_chunks:
-        return None, "No readable text found."
-
-    all_chunks = all_chunks[:MAX_CHUNKS]
-    all_meta   = all_meta[:MAX_CHUNKS]
+    if not chunks:
+        return None
 
     # BM25
-    tokenized = [c.lower().split() for c in all_chunks]
+    tokenized = [c.lower().split() for c in chunks]
     bm25 = BM25Okapi(tokenized)
 
-    # FAISS
-    embeddings = EMBED_MODEL.encode(all_chunks)
-    embeddings = np.array(embeddings).astype("float32")
-
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
-    index.add(embeddings)
+    # TF-IDF (semantic fallback)
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf_matrix = vectorizer.fit_transform(chunks)
 
     return {
-        "chunks": all_chunks,
-        "meta": all_meta,
+        "chunks": chunks,
+        "meta": meta,
         "bm25": bm25,
-        "faiss": index,
-        "embeddings": embeddings
-    }, None
+        "vectorizer": vectorizer,
+        "tfidf": tfidf_matrix
+    }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HYBRID RETRIEVAL
-# ─────────────────────────────────────────────────────────────────────────────
-
-def retrieve_pdf(query, store):
+# ─────────────────────────────────────────────────────────
+# RETRIEVAL
+# ─────────────────────────────────────────────────────────
+def retrieve(query, store):
     chunks = store["chunks"]
 
     # BM25
     tokenized_query = query.lower().split()
     bm25_scores = store["bm25"].get_scores(tokenized_query)
 
-    # FAISS
-    q_embed = EMBED_MODEL.encode([query])
-    q_embed = np.array(q_embed).astype("float32")
-
-    distances, indices = store["faiss"].search(q_embed, TOP_K)
-
-    faiss_scores = np.zeros(len(chunks))
-    for rank, idx in enumerate(indices[0]):
-        faiss_scores[idx] = 1 / (1 + distances[0][rank])
+    # TF-IDF
+    q_vec = store["vectorizer"].transform([query])
+    tfidf_scores = (store["tfidf"] @ q_vec.T).toarray().ravel()
 
     # Hybrid score
-    alpha = 0.65
-    beta = 0.35
+    alpha = 0.6
+    beta = 0.4
 
-    final_scores = alpha * faiss_scores + beta * bm25_scores
+    final_scores = alpha * tfidf_scores + beta * bm25_scores
 
     top_ids = np.argsort(final_scores)[::-1][:TOP_K]
 
@@ -136,11 +110,9 @@ def retrieve_pdf(query, store):
 
     return results
 
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 # CONTEXT REFINEMENT
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────
 def refine_context(query, docs):
     qwords = set(query.lower().split())
     scored = []
@@ -148,102 +120,60 @@ def refine_context(query, docs):
     for d in docs:
         for sent in d["text"].split("."):
             s = sent.strip()
-            if len(s) < 30:
+            if len(s) < 25:
                 continue
             score = sum(1 for w in qwords if w in s.lower())
             if score:
                 scored.append((score, s))
 
     scored.sort(reverse=True)
-    top = [s for _, s in scored[:12]]
 
-    if top:
-        return ". ".join(top)
+    if scored:
+        return ". ".join([s for _, s in scored[:10]])
 
-    return "\n\n".join(d["text"][:400] for d in docs[:3])
+    return "\n\n".join(d["text"][:300] for d in docs[:3])
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIMPLE LLM (GROQ / OPENAI COMPATIBLE)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_llm(api_key):
-    from groq import Groq
-    return Groq(api_key=api_key)
-
-
-def llm_answer(llm, prompt):
-    resp = llm.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return resp.choices[0].message.content
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ANSWER PIPELINE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def answer_query(query, store, llm):
-    docs = retrieve_pdf(query, store)
-
-    if not docs:
-        return "No relevant information found."
-
+# ─────────────────────────────────────────────────────────
+# LOCAL ANSWER (NO LLM → ALWAYS WORKS)
+# ─────────────────────────────────────────────────────────
+def local_answer(query, docs):
     context = refine_context(query, docs)
+    return f"**Answer (from document):**\n\n{context}"
 
-    prompt = f"""
-You are an expert assistant.
-Answer ONLY using the context below.
-
-Context:
-{context}
-
-Question:
-{query}
-"""
-
-    try:
-        answer = llm_answer(llm, prompt)
-    except:
-        answer = context[:800]
-
-    return answer, docs
-
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 # UI
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 
-st.title("⚡ Neural Knowledge Engine (Hybrid RAG)")
-
-api_key = st.text_input("Enter Groq API Key", type="password")
+st.title("⚡ Neural Knowledge Engine (Stable Edition)")
 
 files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
 
-if st.button("Initialize"):
-    if not files or not api_key:
-        st.error("Upload files and API key")
+if st.button("Initialize Engine"):
+    if not files:
+        st.error("Upload PDFs first.")
     else:
         with st.spinner("Indexing..."):
-            store, err = build_pdf_index(files)
-            if err:
-                st.error(err)
+            store = build_index(files)
+            if not store:
+                st.error("No readable text found.")
             else:
                 st.session_state.store = store
-                st.session_state.llm = get_llm(api_key)
-                st.success("Ready!")
+                st.success("Engine Ready 🚀")
 
-# Chat
+# ─────────────────────────────────────────────────────────
+# QUERY
+# ─────────────────────────────────────────────────────────
+
 if "store" in st.session_state:
-    query = st.text_input("Ask something")
+    query = st.text_input("Ask anything from your PDFs")
 
     if query:
-        with st.spinner("Thinking..."):
-            ans, docs = answer_query(query, st.session_state.store, st.session_state.llm)
+        with st.spinner("Searching..."):
+            docs = retrieve(query, st.session_state.store)
+            answer = local_answer(query, docs)
 
-        st.write(ans)
+        st.markdown(answer)
 
-        st.markdown("### Sources")
+        st.markdown("### 📄 Sources")
         for d in docs:
             st.write(f"{d['source']} (Page {d['page']})")
