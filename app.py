@@ -1,179 +1,257 @@
 import streamlit as st
-import tempfile, os
-import numpy as np
-import pypdf
+import os
+from pdf_utils import load_and_chunk_pdfs
+from embeddings import EmbeddingManager
+from retrieval import HybridRetriever
+from qa import QASystem
+import tempfile
 
-from rank_bm25 import BM25Okapi
-from sklearn.feature_extraction.text import TfidfVectorizer
+# =========================
+# PAGE CONFIG
+# =========================
+st.set_page_config(
+    page_title="Neural Knowledge Engine",
+    page_icon="🧠",
+    layout="wide"
+)
 
-# ─────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────
-st.set_page_config(page_title="⚡ Neural Knowledge Engine", layout="wide")
+# =========================
+# CUSTOM CSS (🔥 GLOW UI)
+# =========================
+st.markdown("""
+<style>
 
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 100
-TOP_K = 6
+body {
+    background: linear-gradient(135deg, #0f172a, #020617);
+    color: #e2e8f0;
+}
 
-# ─────────────────────────────────────────────────────────
-# PDF PROCESSING
-# ─────────────────────────────────────────────────────────
-def extract_chunks(file_bytes, filename):
-    chunks, meta = [], []
+/* Title Glow */
+.title-glow {
+    font-size: 2.5rem;
+    font-weight: 800;
+    text-align: center;
+    color: #38bdf8;
+    text-shadow: 0 0 10px #38bdf8, 0 0 20px #0ea5e9;
+}
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
-        f.write(file_bytes)
-        tmp = f.name
+/* Card Style */
+.glow-card {
+    background: rgba(15, 23, 42, 0.7);
+    border-radius: 16px;
+    padding: 20px;
+    border: 1px solid #1e293b;
+    transition: 0.3s ease-in-out;
+}
 
-    try:
-        reader = pypdf.PdfReader(tmp)
-        for page_num, page in enumerate(reader.pages):
-            text = (page.extract_text() or "").strip()
-            if not text:
-                continue
+/* Hover Glow Effect */
+.glow-card:hover {
+    transform: translateY(-5px) scale(1.01);
+    box-shadow: 0 0 20px #38bdf8, 0 0 40px #0ea5e9;
+    border: 1px solid #38bdf8;
+}
 
-            text = " ".join(text.split())
+/* Chat bubbles */
+[data-testid="stChatMessage"] {
+    border-radius: 12px;
+    padding: 10px;
+    margin-bottom: 10px;
+}
 
-            start = 0
-            while start < len(text):
-                chunk = text[start:start+CHUNK_SIZE]
-                if len(chunk) > 80:
-                    chunks.append(chunk)
-                    meta.append({"source": filename, "page": page_num + 1})
-                start += CHUNK_SIZE - CHUNK_OVERLAP
+/* Input box glow */
+textarea {
+    background-color: #020617 !important;
+    color: white !important;
+    border-radius: 12px !important;
+    border: 1px solid #1e293b !important;
+}
 
-    finally:
-        os.remove(tmp)
+textarea:focus {
+    border: 1px solid #38bdf8 !important;
+    box-shadow: 0 0 10px #38bdf8 !important;
+}
 
-    return chunks, meta
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background: #020617;
+}
 
-# ─────────────────────────────────────────────────────────
-# HYBRID INDEX (BM25 + TF-IDF)
-# ─────────────────────────────────────────────────────────
-def build_index(files):
-    chunks, meta = [], []
+/* Buttons */
+button[kind="primary"] {
+    background: #0ea5e9 !important;
+    border-radius: 10px !important;
+}
 
-    for f in files:
-        c, m = extract_chunks(f.getvalue(), f.name)
-        chunks.extend(c)
-        meta.extend(m)
+button:hover {
+    box-shadow: 0 0 10px #38bdf8 !important;
+}
 
-    if not chunks:
-        return None
+</style>
+""", unsafe_allow_html=True)
 
-    # BM25
-    tokenized = [c.lower().split() for c in chunks]
-    bm25 = BM25Okapi(tokenized)
+# =========================
+# HEADER
+# =========================
+st.markdown('<div class="title-glow">🧠 NEURAL KNOWLEDGE ENGINE</div>', unsafe_allow_html=True)
+st.markdown("### ⚡ Hybrid Intelligence (FAISS + BM25 + LLM Reasoning)")
 
-    # TF-IDF (semantic fallback)
-    vectorizer = TfidfVectorizer(stop_words="english")
-    tfidf_matrix = vectorizer.fit_transform(chunks)
+# =========================
+# SESSION STATE INIT
+# =========================
+for key in ["documents", "embedding_manager", "retriever", "qa_system", "chat_history", "processed_files"]:
+    if key not in st.session_state:
+        st.session_state[key] = [] if key in ["chat_history", "processed_files"] else None
 
-    return {
-        "chunks": chunks,
-        "meta": meta,
-        "bm25": bm25,
-        "vectorizer": vectorizer,
-        "tfidf": tfidf_matrix
-    }
+# =========================
+# API KEYS
+# =========================
+try:
+    groq_api_key = st.secrets["GROQ_API_KEY"]
+except:
+    st.error("⚠️ Add GROQ_API_KEY in Streamlit Secrets")
+    st.stop()
 
-# ─────────────────────────────────────────────────────────
-# RETRIEVAL
-# ─────────────────────────────────────────────────────────
-def retrieve(query, store):
-    chunks = store["chunks"]
+qdrant_api_key = st.secrets.get("QDRANT_API_KEY", None)
+qdrant_endpoint = st.secrets.get("QDRANT_ENDPOINT", None)
+use_qdrant = bool(qdrant_api_key and qdrant_endpoint)
 
-    # BM25
-    tokenized_query = query.lower().split()
-    bm25_scores = store["bm25"].get_scores(tokenized_query)
+# =========================
+# SIDEBAR (UPLOAD)
+# =========================
+st.sidebar.markdown("## 📁 Upload Knowledge Base")
 
-    # TF-IDF
-    q_vec = store["vectorizer"].transform([query])
-    tfidf_scores = (store["tfidf"] @ q_vec.T).toarray().ravel()
+uploaded_files = st.sidebar.file_uploader(
+    "Drop PDFs",
+    type="pdf",
+    accept_multiple_files=True
+)
 
-    # Hybrid score
-    alpha = 0.6
-    beta = 0.4
+# =========================
+# PROCESS FILES
+# =========================
+if uploaded_files:
+    current_files = [f.name for f in uploaded_files]
 
-    final_scores = alpha * tfidf_scores + beta * bm25_scores
+    if current_files != st.session_state.processed_files:
+        with st.spinner("⚡ Indexing Neural Data..."):
+            try:
+                temp_paths = []
+                for f in uploaded_files:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(f.read())
+                        temp_paths.append(tmp.name)
 
-    top_ids = np.argsort(final_scores)[::-1][:TOP_K]
+                documents = load_and_chunk_pdfs(temp_paths, chunk_size=150, overlap=30)
 
-    results = []
-    for i in top_ids:
-        if final_scores[i] > 0:
-            results.append({
-                "text": chunks[i],
-                **store["meta"][i],
-                "score": float(final_scores[i])
-            })
+                for path in temp_paths:
+                    os.unlink(path)
 
-    return results
+                if not documents:
+                    st.error("❌ No extractable text found")
+                    st.stop()
 
-# ─────────────────────────────────────────────────────────
-# CONTEXT REFINEMENT
-# ─────────────────────────────────────────────────────────
-def refine_context(query, docs):
-    qwords = set(query.lower().split())
-    scored = []
+                st.session_state.documents = documents
 
-    for d in docs:
-        for sent in d["text"].split("."):
-            s = sent.strip()
-            if len(s) < 25:
-                continue
-            score = sum(1 for w in qwords if w in s.lower())
-            if score:
-                scored.append((score, s))
+                embedding_manager = EmbeddingManager(
+                    use_qdrant=use_qdrant,
+                    qdrant_api_key=qdrant_api_key,
+                    qdrant_endpoint=qdrant_endpoint
+                )
+                embedding_manager.build_index(documents)
 
-    scored.sort(reverse=True)
+                retriever = HybridRetriever(embedding_manager, documents, top_k=7)
+                qa_system = QASystem(groq_api_key, retriever)
 
-    if scored:
-        return ". ".join([s for _, s in scored[:10]])
+                st.session_state.embedding_manager = embedding_manager
+                st.session_state.retriever = retriever
+                st.session_state.qa_system = qa_system
+                st.session_state.chat_history = []
+                st.session_state.processed_files = current_files
 
-    return "\n\n".join(d["text"][:300] for d in docs[:3])
+                st.sidebar.success(f"✅ {len(uploaded_files)} PDFs → {len(documents)} chunks")
 
-# ─────────────────────────────────────────────────────────
-# LOCAL ANSWER (NO LLM → ALWAYS WORKS)
-# ─────────────────────────────────────────────────────────
-def local_answer(query, docs):
-    context = refine_context(query, docs)
-    return f"**Answer (from document):**\n\n{context}"
+            except Exception as e:
+                st.error(str(e))
+                st.stop()
 
-# ─────────────────────────────────────────────────────────
-# UI
-# ─────────────────────────────────────────────────────────
+# =========================
+# MAIN CHAT UI
+# =========================
+if st.session_state.documents:
 
-st.title("⚡ Neural Knowledge Engine (Stable Edition)")
+    st.markdown('<div class="glow-card">', unsafe_allow_html=True)
+    st.markdown("### 💬 Neural Conversation")
 
-files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-if st.button("Initialize Engine"):
-    if not files:
-        st.error("Upload PDFs first.")
-    else:
-        with st.spinner("Indexing..."):
-            store = build_index(files)
-            if not store:
-                st.error("No readable text found.")
-            else:
-                st.session_state.store = store
-                st.success("Engine Ready 🚀")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────
-# QUERY
-# ─────────────────────────────────────────────────────────
+    question = st.chat_input("Ask anything...")
 
-if "store" in st.session_state:
-    query = st.text_input("Ask anything from your PDFs")
+    if question:
+        st.session_state.chat_history.append({"role": "user", "content": question})
 
-    if query:
-        with st.spinner("Searching..."):
-            docs = retrieve(query, st.session_state.store)
-            answer = local_answer(query, docs)
+        with st.chat_message("user"):
+            st.markdown(question)
 
-        st.markdown(answer)
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            response = ""
 
-        st.markdown("### 📄 Sources")
-        for d in docs:
-            st.write(f"{d['source']} (Page {d['page']})")
+            try:
+                for chunk in st.session_state.qa_system.answer_question(
+                    question,
+                    chat_history=st.session_state.chat_history[-10:]
+                ):
+                    response += chunk
+                    placeholder.markdown(response + "▌")
+
+                placeholder.markdown(response)
+
+                st.session_state.chat_history.append({"role": "assistant", "content": response})
+
+                # Debug viewer
+                with st.expander("🔍 Neural Retrieval Insights"):
+                    results = st.session_state.retriever.hybrid_search(question)
+                    for i, (doc, score) in enumerate(results[:3], 1):
+                        st.markdown(f"**Chunk {i} | Score: {score:.3f}**")
+                        st.text(doc[:300] + "...")
+
+            except Exception as e:
+                st.error(str(e))
+
+    if st.sidebar.button("🧹 Reset Memory"):
+        st.session_state.chat_history = []
+        st.rerun()
+
+else:
+    st.markdown('<div class="glow-card">', unsafe_allow_html=True)
+    st.info("👈 Upload PDFs to activate the engine")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("""
+        ### 🧠 Capabilities
+        - Hybrid Retrieval (FAISS + BM25)
+        - Deep Semantic Understanding
+        - Multi-document reasoning
+        """)
+
+    with col2:
+        st.markdown("""
+        ### ⚡ Performance
+        - Real-time streaming
+        - Context-aware answers
+        - Persistent vector DB (Qdrant optional)
+        """)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# =========================
+# FOOTER
+# =========================
+st.sidebar.markdown("---")
+st.sidebar.markdown("⚡ NEURAL CORE ACTIVE")
